@@ -12,6 +12,13 @@
     out of date prompts the user Y/N/A before running Update-Module. Supports -WhatIf
     and -Confirm via ShouldProcess in addition to the interactive Y/N/A prompt.
 
+    Some modules (e.g. Microsoft.Graph) are "meta" packages whose RequiredModules
+    pin a whole family of submodules (Microsoft.Graph.*) to the same version. Updating
+    the parent therefore silently updates those submodules too. After updating a
+    module listed in $CascadeParentModules, the script re-checks the installed
+    version of every not-yet-processed module in that family so it doesn't prompt to
+    update something that was already brought current as a side effect.
+
 .PARAMETER ExcludeModule
     Module name(s) to skip. Wildcards allowed.
 
@@ -33,7 +40,7 @@
 
 .NOTES
     Name:    Update-InstalledModules.v2.0.0.ps1
-    Version: 2.0.0
+    Version: 2.1.0
     Author: simonan@softcat.com
     Author: si@tumeke.cloud
     Prerequisites:
@@ -49,7 +56,14 @@ param(
     [ValidateSet('CurrentUser', 'AllUsers')]
     [string]$Scope = 'CurrentUser',
 
-    [switch]$Force
+    [switch]$Force,
+
+    # Modules whose update cascades to a family of submodules (e.g. updating
+    # Microsoft.Graph also updates Microsoft.Graph.Authentication, Microsoft.Graph.Users, etc.
+    # because they're pinned RequiredModules). After updating one of these, the
+    # remaining not-yet-processed modules matching "<Name>.*" are re-checked
+    # against their real installed version instead of the stale pre-update snapshot.
+    [string[]]$CascadeParentModules = @('Microsoft.Graph')
 )
 
 Set-StrictMode -Version Latest
@@ -89,6 +103,41 @@ function Test-ModuleExcluded {
     return $false
 }
 
+function Sync-CascadedModuleVersions {
+    <#
+        After a cascade-parent module (e.g. Microsoft.Graph) is updated, its
+        RequiredModules submodules get updated as a side effect. Refresh the
+        recorded Version for the remaining not-yet-processed modules in $Modules
+        so later loop iterations don't see the stale pre-update version and
+        re-prompt to "update" something that's already current.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.Generic.List[PSCustomObject]]$Modules,
+
+        [Parameter(Mandatory)]
+        [int]$FromIndex,
+
+        [Parameter(Mandatory)]
+        [string]$ParentName
+    )
+
+    $current = @(Get-InstalledModule -Name "$ParentName*" -ErrorAction SilentlyContinue)
+    if ($current.Count -eq 0) { return }
+
+    $lookup = @{}
+    foreach ($c in $current) { $lookup[$c.Name] = $c.Version }
+
+    for ($j = $FromIndex; $j -lt $Modules.Count; $j++) {
+        $entry = $Modules[$j]
+        if ($lookup.ContainsKey($entry.Name) -and [version]$lookup[$entry.Name] -ne [version]$entry.Version) {
+            Write-Verbose "$($entry.Name) was already updated as a dependency of $ParentName ($($entry.Version) -> $($lookup[$entry.Name]))"
+            $entry.Version = $lookup[$entry.Name]
+        }
+    }
+}
+
 if ($Scope -eq 'AllUsers') {
     $currentPrincipal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
     if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -98,7 +147,13 @@ if ($Scope -eq 'AllUsers') {
 
 Write-Host "Gathering installed modules..." -ForegroundColor Cyan
 
-$installedModules = @(Get-InstalledModule -ErrorAction SilentlyContinue | Sort-Object -Property Name)
+$installedModules = [System.Collections.Generic.List[PSCustomObject]]::new()
+@(Get-InstalledModule -ErrorAction SilentlyContinue | Sort-Object -Property Name) | ForEach-Object {
+    $installedModules.Add([PSCustomObject]@{
+        Name    = $_.Name
+        Version = $_.Version
+    })
+}
 
 if ($installedModules.Count -eq 0) {
     Write-Warning "No modules found via Get-InstalledModule. Are you running this in a session with PowerShellGet available?"
@@ -110,15 +165,14 @@ $updatesFound = 0
 $updatesInstalled = 0
 $results = [System.Collections.Generic.List[PSCustomObject]]::new()
 $yesToAll = $Force.IsPresent
-$moduleIndex = 0
 
-foreach ($module in $installedModules) {
+for ($moduleIndex = 0; $moduleIndex -lt $installedModules.Count; $moduleIndex++) {
 
+    $module = $installedModules[$moduleIndex]
     $latest = $null
-    $moduleIndex++
     Write-Progress -Activity 'Checking installed modules' `
-        -Status "($moduleIndex of $($installedModules.Count)) $($module.Name)" `
-        -PercentComplete (($moduleIndex / $installedModules.Count) * 100)
+        -Status "($($moduleIndex + 1) of $($installedModules.Count)) $($module.Name)" `
+        -PercentComplete ((($moduleIndex + 1) / $installedModules.Count) * 100)
 
     if (Test-ModuleExcluded -Name $module.Name -Pattern $ExcludeModule) {
         continue
@@ -178,6 +232,11 @@ foreach ($module in $installedModules) {
                 Latest    = $latest.Version
                 Action    = 'Updated'
             })
+
+            if ($module.Name -in $CascadeParentModules) {
+                Write-Verbose "$($module.Name) is a cascade parent - re-checking installed versions of its submodules..."
+                Sync-CascadedModuleVersions -Modules $installedModules -FromIndex ($moduleIndex + 1) -ParentName $module.Name
+            }
         }
         catch {
             Write-Warning "Failed to update $($module.Name): $($_.Exception.Message)"
